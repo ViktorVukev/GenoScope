@@ -35,3 +35,8 @@ htmlcov/
 Thumbs.db
 desktop.ini
 
+# Large RNA-seq datasets (exceed GitHub 100MB push limit)
+data/data.csv
+data/labels.csv
+data/TCGA-PANCAN-HiSeq-801x20531.csv
+
