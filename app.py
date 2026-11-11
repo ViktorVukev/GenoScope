@@ -2,10 +2,12 @@
 from RNA-seq gene expression data.
 Step 1: Data Upload, Template, and Exploratory Visualization.
 Step 2: Stratified Train / Test Split (80% Training / 20% Testing).
+Step 3: Model Training (MLP Neural Network, Random Forest, Logistic Regression).
+Step 4: Model Evaluation, Comparison, and Biological Interpretability.
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 import pandas as pd
 import streamlit as st
 
@@ -16,6 +18,13 @@ from src.data_loader import (
     split_dataset_from_metadata,
     validate_dataset,
 )
+from src.evaluation import (
+    calculate_metrics,
+    plot_confusion_matrix,
+    plot_feature_importance,
+    plot_roc_curves,
+)
+from src.models import train_all_models
 from src.visualization import plot_pca, plot_umap
 
 # Configure page layout and metadata
@@ -94,14 +103,16 @@ st.markdown(
 )
 
 
-def ensure_template_exists() -> Path:
-    """Ensure the template CSV file exists on disk and return its path.
+def preview_large_df(df: pd.DataFrame, max_rows: int = 15, max_cols: int = 12) -> pd.DataFrame:
+    """Return a lightweight slice of a wide DataFrame so Streamlit UI stays responsive."""
+    if df.shape[1] <= max_cols:
+        return df.head(max_rows)
+    head_cols = list(df.columns[: max_cols - 1]) + [df.columns[-1]]
+    return df[head_cols].head(max_rows)
 
-    Returns
-    -------
-    Path
-        Path to the template CSV file.
-    """
+
+def ensure_template_exists() -> Path:
+    """Ensure the template CSV file exists on disk and return its path."""
     template_path = Path("data/sample_template.csv")
     if not template_path.exists():
         save_sample_template(template_path)
@@ -109,13 +120,7 @@ def ensure_template_exists() -> Path:
 
 
 def render_header(current_step: int = 1) -> None:
-    """Render top application header and workflow pipeline summary.
-
-    Parameters
-    ----------
-    current_step : int, default=1
-        The current active stage in the 4-step workflow.
-    """
+    """Render top application header and workflow pipeline summary."""
     stage_titles = {
         1: "Stage 1 of 4: Exploratory Analysis",
         2: "Stage 2 of 4: Stratified Train / Test Split",
@@ -140,13 +145,7 @@ def render_header(current_step: int = 1) -> None:
 
 
 def render_format_instructions(template_path: Path) -> None:
-    """Render data specification instructions, visual table preview, and download controls.
-
-    Parameters
-    ----------
-    template_path : Path
-        Path to the template CSV file.
-    """
+    """Render data specification instructions, visual table preview, and download controls."""
     st.markdown("### Step 1: Data Upload, Template, and Exploratory Visualization")
     st.write(
         "To begin analysis, upload a normalized RNA-seq gene expression dataset in CSV format. "
@@ -209,16 +208,13 @@ def render_format_instructions(template_path: Path) -> None:
             st.session_state["source_label"] = "Built-in Sample Template (30 patients, 8 genes, 3 classes)"
             st.session_state["current_step"] = 1
             st.session_state["split_data"] = None
+            st.session_state["model_results"] = None
+            st.session_state["fig_pca"] = None
+            st.session_state["fig_umap"] = None
 
 
 def render_step2_split(metadata: Dict[str, Any]) -> None:
-    """Render Step 2: Stratified Train / Test Split and developer integration tables.
-
-    Parameters
-    ----------
-    metadata : Dict[str, Any]
-        Metadata dictionary extracted from validated dataset.
-    """
+    """Render Step 2: Stratified Train / Test Split and developer integration tables."""
     st.markdown("### Step 2: Stratified Train / Test Split (80% / 20%)")
     st.markdown(
         """
@@ -253,7 +249,6 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
         st.write("")
         recompute_btn = st.button("Recompute 80/20 Split", key="recompute_split_btn")
 
-    # Compute or retrieve split
     need_computation = (
         "split_data" not in st.session_state
         or st.session_state["split_data"] is None
@@ -269,8 +264,6 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
                 stratify=True,
             )
             st.session_state["split_data"] = split_data
-
-            # Store direct references in session state for teammates working on models and evaluation
             st.session_state["X_train"] = split_data["X_train"]
             st.session_state["y_train"] = split_data["y_train"]
             st.session_state["X_test"] = split_data["X_test"]
@@ -279,13 +272,13 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
             st.session_state["test_df"] = split_data["test_df"]
             st.session_state["test_features_df"] = split_data["test_features_df"]
             st.session_state["test_labels_df"] = split_data["test_labels_df"]
+            st.session_state["model_results"] = None
         except Exception as exc:
             st.error(f"Error computing stratified split: {exc}")
             return
     else:
         split_data = st.session_state["split_data"]
 
-    # Metrics overview
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
     train_pct = (1.0 - split_data["test_ratio"]) * 100.0
     test_pct = split_data["test_ratio"] * 100.0
@@ -294,12 +287,10 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
     m_col3.metric("Gene Features", f"{len(split_data['gene_cols'])} genes")
     m_col4.metric("Diagnosis Classes", f"{len(split_data['classes'])} classes")
 
-    # Stratification Verification Table
     st.markdown("#### Stratification Verification")
     st.caption("Verification that relative class frequencies are identically maintained across both partitions:")
 
     balance_rows = []
-    total_patients = split_data["train_size"] + split_data["test_size"]
     for cancer_class in split_data["classes"]:
         n_train = split_data["class_distribution_train"].get(cancer_class, 0)
         n_test = split_data["class_distribution_test"].get(cancer_class, 0)
@@ -316,10 +307,8 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
             "Test Proportion": f"{class_pct_in_test:.1f}%",
         })
 
-    balance_df = pd.DataFrame(balance_rows)
-    st.dataframe(balance_df, use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(balance_rows), use_container_width=True, hide_index=True)
 
-    # Blind Prediction Callout
     st.markdown(
         """
         <div class="success-callout">
@@ -333,8 +322,13 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    # Split Tables Inspection and Download Tabs
-    st.markdown("#### Inspect and Download Partitioned Tables")
+    st.markdown("#### Inspect Partitioned Tables (Preview)")
+    is_large = len(split_data["gene_cols"]) > 50
+    if is_large:
+        st.caption(
+            f"Showing first 15 rows and a subset of columns out of {len(split_data['gene_cols'])} genes "
+            "for fast browser rendering."
+        )
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Training Set (80% with Labels)",
@@ -344,142 +338,181 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
     ])
 
     with tab1:
-        st.markdown(
-            f"**Training Set (`train_df` / `X_train`, `y_train`):** "
-            f"{split_data['train_size']} patients, {len(split_data['gene_cols'])} gene features, plus Diagnosis label."
-        )
-        st.dataframe(split_data["train_df"], use_container_width=True, hide_index=True)
-        st.download_button(
-            label="Download Training Set CSV (80%)",
-            data=split_data["train_df"].to_csv(index=False).encode("utf-8"),
-            file_name="genoscope_train_80pct.csv",
-            mime="text/csv",
-            key="download_train_csv_btn",
-        )
-
+        st.dataframe(preview_large_df(split_data["train_df"]), use_container_width=True, hide_index=True)
     with tab2:
-        st.markdown(
-            f"**Test Features (`test_features_df` / `X_test`):** "
-            f"{split_data['test_size']} patients, {len(split_data['gene_cols'])} gene features. "
-            f"Diagnosis column is strictly withheld."
-        )
-        st.dataframe(split_data["test_features_df"], use_container_width=True, hide_index=True)
-        st.download_button(
-            label="Download Test Features CSV (20% Target Hidden)",
-            data=split_data["test_features_df"].to_csv(index=False).encode("utf-8"),
-            file_name="genoscope_test_features_unlabelled_20pct.csv",
-            mime="text/csv",
-            key="download_test_features_csv_btn",
-        )
-
+        st.dataframe(preview_large_df(split_data["test_features_df"]), use_container_width=True, hide_index=True)
     with tab3:
-        st.markdown(
-            f"**Test Ground Truth (`test_labels_df` / `y_test`):** "
-            f"{split_data['test_size']} patients with true diagnoses for final benchmarking."
-        )
-        st.dataframe(split_data["test_labels_df"], use_container_width=True, hide_index=True)
-        st.download_button(
-            label="Download Test Labels CSV (20% Ground Truth)",
-            data=split_data["test_labels_df"].to_csv(index=False).encode("utf-8"),
-            file_name="genoscope_test_ground_truth_labels_20pct.csv",
-            mime="text/csv",
-            key="download_test_labels_csv_btn",
-        )
-
+        st.dataframe(split_data["test_labels_df"].head(30), use_container_width=True, hide_index=True)
     with tab4:
-        st.markdown(
-            f"**Complete Test Set (`test_df`):** "
-            f"{split_data['test_size']} patients with all genes and diagnosis label."
+        st.dataframe(preview_large_df(split_data["test_df"]), use_container_width=True, hide_index=True)
+
+
+def render_step3_and_step4() -> None:
+    """Render Step 3 (Model Training) and Step 4 (Evaluation & Comparison)."""
+    st.markdown("---")
+    st.markdown("### Step 3: Model Training (Deep Learning vs. Classical Baselines)")
+    st.markdown(
+        """
+        <div class="info-callout">
+            Train three distinct classification models on the exact same <b>80% training split</b>:
+            a <b>Multi-Layer Perceptron (MLP) Neural Network</b>, a <b>Random Forest</b> ensemble,
+            and multinomial <b>Logistic Regression</b>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cfg_col1, cfg_col2, cfg_col3, cfg_col4 = st.columns(4)
+    with cfg_col1:
+        mlp_arch_label = st.selectbox(
+            "MLP Hidden Layers",
+            options=["(128, 64)", "(256, 128, 64)", "(64, 32)"],
+            index=0,
+            key="mlp_arch_select",
         )
-        st.dataframe(split_data["test_df"], use_container_width=True, hide_index=True)
-        st.download_button(
-            label="Download Full Test Set CSV (20%)",
-            data=split_data["test_df"].to_csv(index=False).encode("utf-8"),
-            file_name="genoscope_test_full_20pct.csv",
-            mime="text/csv",
-            key="download_test_full_csv_btn",
+        arch_map = {
+            "(128, 64)": (128, 64),
+            "(256, 128, 64)": (256, 128, 64),
+            "(64, 32)": (64, 32),
+        }
+        mlp_layers = arch_map[mlp_arch_label]
+
+    with cfg_col2:
+        rf_trees = st.number_input(
+            "Random Forest Trees",
+            min_value=50,
+            max_value=500,
+            value=200,
+            step=50,
+            key="rf_trees_input",
         )
 
-    # Teammate Developer Reference Guide
-    with st.expander("Developer Guide: How Teammates Can Access These Tables", expanded=True):
-        st.markdown(
-            """
-            This section specifies how teammates developing **Step 3 (`src/models.py`)** and
-            **Step 4 (`src/evaluation.py`)** can directly consume these partitions.
-
-            ---
-
-            ##### 1. Accessing via Streamlit Session State (Inside `app.py`)
-            Teammates implementing subsequent steps in Streamlit can access the split tables directly:
-            ```python
-            # Training inputs for Step 3 (Neural Network, Random Forest, Logistic Regression):
-            X_train = st.session_state["X_train"]  # pd.DataFrame: shape (N_train, N_genes)
-            y_train = st.session_state["y_train"]  # pd.Series: shape (N_train,)
-            train_df = st.session_state["train_df"]  # pd.DataFrame: complete 80% table
-
-            # Testing inputs for Step 4 (Model Evaluation):
-            X_test = st.session_state["X_test"]    # pd.DataFrame: shape (N_test, N_genes), NO diagnosis
-            y_test = st.session_state["y_test"]    # pd.Series: shape (N_test,), ground truth
-            test_df = st.session_state["test_df"]  # pd.DataFrame: complete 20% table with labels
-
-            # All partition metadata:
-            split_data = st.session_state["split_data"]
-            classes = split_data["classes"]        # List of cancer diagnoses
-            gene_cols = split_data["gene_cols"]    # List of gene names
-            ```
-
-            ---
-
-            ##### 2. Accessing Programmatically via Python (Inside `src/models.py` or `src/evaluation.py`)
-            Teammates writing backend modules or unit tests can import and execute the split directly:
-            ```python
-            from src.data_loader import load_dataset_from_csv, validate_dataset, split_dataset_from_metadata
-
-            # 1. Load and validate dataset
-            df = load_dataset_from_csv("data/sample_template.csv")
-            is_valid, _, metadata = validate_dataset(df)
-
-            # 2. Perform 80/20 stratified split
-            split_data = split_dataset_from_metadata(metadata, test_size=0.20, random_state=42)
-
-            X_train, y_train = split_data["X_train"], split_data["y_train"]
-            X_test, y_test = split_data["X_test"], split_data["y_test"]
-            ```
-
-            ---
-
-            ##### 3. Model Training Contract (Step 3 Teammate)
-            All 3 models must be fitted strictly on `(X_train, y_train)`:
-            ```python
-            mlp_model.fit(X_train, y_train)
-            rf_model.fit(X_train, y_train)
-            lr_model.fit(X_train, y_train)
-            ```
-
-            ##### 4. Evaluation Contract (Step 4 Teammate)
-            Generate predictions using `X_test` (diagnosis hidden), then benchmark against `y_test`:
-            ```python
-            y_pred = model.predict(X_test)
-            y_prob = model.predict_proba(X_test)
-            # Evaluate: accuracy_score(y_test, y_pred), confusion_matrix(y_test, y_pred), roc_curve(...)
-            ```
-            """
+    with cfg_col3:
+        lr_c = st.number_input(
+            "Logistic Regression (C)",
+            min_value=0.01,
+            max_value=10.0,
+            value=1.0,
+            step=0.25,
+            key="lr_c_input",
         )
+
+    with cfg_col4:
+        top_n_genes = st.slider(
+            "Top Biomarker Genes",
+            min_value=5,
+            max_value=30,
+            value=15,
+            step=5,
+            key="top_n_genes_slider",
+        )
+
+    if st.button("Train All 3 Models & Run Evaluation", type="primary", key="train_models_btn"):
+        X_train = st.session_state["X_train"]
+        y_train = st.session_state["y_train"]
+        X_test = st.session_state["X_test"]
+        split_data = st.session_state["split_data"]
+
+        with st.spinner("Training Neural Network (MLP), Random Forest, and Logistic Regression on 80% split..."):
+            model_results = train_all_models(
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                classes=split_data["classes"],
+                mlp_hidden_layers=mlp_layers,
+                rf_n_estimators=int(rf_trees),
+                lr_c=float(lr_c),
+                random_state=int(split_data["random_state"]),
+            )
+            st.session_state["model_results"] = model_results
+            st.session_state["current_step"] = 4
+
+    if "model_results" not in st.session_state or st.session_state["model_results"] is None:
+        return
+
+    model_results = st.session_state["model_results"]
+    y_test = st.session_state["y_test"]
+    split_data = st.session_state["split_data"]
+    classes = split_data["classes"]
+    gene_cols = split_data["gene_cols"]
 
     st.markdown("---")
-    st.markdown("#### Proceed to Step 3: Model Training")
-    st.info(
-        "80/20 train/test split successfully established and verified. "
-        "The partitions are now staged in `st.session_state` and ready for Step 3 "
-        "(Neural Network MLP, Random Forest, and Logistic Regression training)."
-    )
+    st.markdown("### Step 4: Model Evaluation, Comparison & Biological Interpretability")
+
+    summary_rows = []
+    metric_cols = st.columns(3)
+
+    for idx, (key, res) in enumerate(model_results.items()):
+        metrics = calculate_metrics(y_test, res.y_pred)
+        with metric_cols[idx]:
+            st.metric(
+                label=res.model_name,
+                value=f"{metrics['accuracy_pct']:.1f}% Accuracy",
+                delta=f"{metrics['correct_count']} / {metrics['total_count']} patients ({res.training_time_sec:.2f}s)",
+            )
+        summary_rows.append({
+            "Model": res.model_name,
+            "Test Accuracy": metrics["formatted_accuracy"],
+            "Correct Predictions": metrics["correct_count"],
+            "Total Test Patients": metrics["total_count"],
+            "Training Time (s)": f"{res.training_time_sec:.2f}s",
+        })
+
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    model_tabs = st.tabs([
+        "Neural Network (MLP)",
+        "Random Forest",
+        "Logistic Regression",
+    ])
+
+    for tab, key in zip(model_tabs, ["mlp", "rf", "lr"]):
+        res = model_results[key]
+        metrics = calculate_metrics(y_test, res.y_pred)
+
+        with tab:
+            st.markdown(
+                f"""
+                <div class="success-callout">
+                    <b>{res.model_name} Performance:</b> {metrics['formatted_accuracy']}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            chart_col1, chart_col2 = st.columns(2)
+            with chart_col1:
+                fig_cm = plot_confusion_matrix(
+                    y_true=y_test,
+                    y_pred=res.y_pred,
+                    classes=classes,
+                    model_name=res.model_name,
+                )
+                st.plotly_chart(fig_cm, use_container_width=True)
+
+            with chart_col2:
+                fig_roc = plot_roc_curves(
+                    y_true=y_test,
+                    y_prob=res.y_prob,
+                    classes=classes,
+                    model_name=res.model_name,
+                )
+                st.plotly_chart(fig_roc, use_container_width=True)
+
+            fig_imp = plot_feature_importance(
+                model=res.estimator,
+                gene_cols=gene_cols,
+                top_n=top_n_genes,
+                model_name=res.model_name,
+            )
+            if fig_imp is not None:
+                st.plotly_chart(fig_imp, use_container_width=True)
 
 
 def main() -> None:
-    """Main application execution pipeline for Steps 1 and 2."""
+    """Main application execution pipeline for Steps 1, 2, 3, and 4."""
     template_path = ensure_template_exists()
 
-    # Track active workflow step
     if "current_step" not in st.session_state:
         st.session_state["current_step"] = 1
 
@@ -488,7 +521,6 @@ def main() -> None:
 
     st.markdown("---")
 
-    # CSV File Uploader
     uploaded_file = st.file_uploader(
         "Upload RNA-seq CSV File",
         type=["csv"],
@@ -497,17 +529,22 @@ def main() -> None:
     )
 
     if uploaded_file is not None:
-        try:
-            st.session_state["raw_df"] = load_dataset_from_csv(uploaded_file)
-            st.session_state["source_label"] = f"Uploaded File: {uploaded_file.name}"
-            # Reset split state when a new file is uploaded
-            st.session_state["current_step"] = 1
-            st.session_state["split_data"] = None
-        except Exception as exc:
-            st.error(f"Error reading CSV file: {exc}")
-            return
+        file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get("uploaded_file_id") != file_id:
+            try:
+                with st.spinner(f"Loading {uploaded_file.name}..."):
+                    st.session_state["raw_df"] = load_dataset_from_csv(uploaded_file)
+                st.session_state["uploaded_file_id"] = file_id
+                st.session_state["source_label"] = f"Uploaded File: {uploaded_file.name}"
+                st.session_state["current_step"] = 1
+                st.session_state["split_data"] = None
+                st.session_state["model_results"] = None
+                st.session_state["fig_pca"] = None
+                st.session_state["fig_umap"] = None
+            except Exception as exc:
+                st.error(f"Error reading CSV file: {exc}")
+                return
 
-    # Check if a dataset is available in session state
     if "raw_df" not in st.session_state:
         st.info("Upload a CSV file or click 'Load Built-in Sample Data' above to proceed with exploratory visualization.")
         return
@@ -515,23 +552,26 @@ def main() -> None:
     raw_df: pd.DataFrame = st.session_state["raw_df"]
     source_label: str = st.session_state.get("source_label", "Active Dataset")
 
-    # Validate dataset structure
-    is_valid, validation_msg, metadata = validate_dataset(raw_df)
-
-    if not is_valid or metadata is None:
-        st.error(f"Dataset Validation Failed: {validation_msg}")
-        return
+    # Cache validation metadata so we don't re-validate 20,531 columns on every button click
+    if "validated_metadata" not in st.session_state or st.session_state.get("validated_source") != source_label:
+        with st.spinner("Validating dataset structure..."):
+            is_valid, validation_msg, metadata = validate_dataset(raw_df)
+        if not is_valid or metadata is None:
+            st.error(f"Dataset Validation Failed: {validation_msg}")
+            return
+        st.session_state["validated_metadata"] = metadata
+        st.session_state["validated_source"] = source_label
+    else:
+        metadata = st.session_state["validated_metadata"]
 
     st.success(f"Validation Succeeded: {source_label}")
 
-    # Dataset Summary Metrics
     st.markdown("#### Dataset Overview")
     metric_col1, metric_col2, metric_col3 = st.columns(3)
     metric_col1.metric("Total Patients", metadata["n_patients"])
     metric_col2.metric("Gene Features", metadata["n_genes"])
     metric_col3.metric("Diagnosis Classes", len(metadata["classes"]))
 
-    # Class distribution breakdown
     with st.expander("View Class Distribution and Data Preview", expanded=False):
         dist_df = pd.DataFrame(
             list(metadata["class_distribution"].items()),
@@ -542,12 +582,11 @@ def main() -> None:
             st.markdown("**Sample Counts per Class:**")
             st.dataframe(dist_df, use_container_width=True, hide_index=True)
         with preview_col:
-            st.markdown("**First 5 Rows of Normalized Data:**")
-            st.dataframe(metadata["clean_df"].head(5), use_container_width=True, hide_index=True)
+            st.markdown("**First 5 Rows of Normalized Data (Preview):**")
+            st.dataframe(preview_large_df(metadata["clean_df"], max_rows=5), use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
-    # Exploratory Dimensionality Reduction Section
     st.markdown("### Exploratory Dimensionality Reduction (PCA & UMAP)")
     st.markdown(
         """
@@ -563,28 +602,29 @@ def main() -> None:
     col_pca, col_umap = st.columns(2)
 
     with col_pca:
-        with st.spinner("Computing 2D PCA projection..."):
-            fig_pca = plot_pca(
-                features=metadata["features"],
-                labels=metadata["labels"],
-                patient_ids=metadata["patient_ids"],
-                random_state=42,
-            )
-            st.plotly_chart(fig_pca, use_container_width=True)
+        if st.session_state.get("fig_pca") is None:
+            with st.spinner("Computing 2D PCA projection..."):
+                st.session_state["fig_pca"] = plot_pca(
+                    features=metadata["features"],
+                    labels=metadata["labels"],
+                    patient_ids=metadata["patient_ids"],
+                    random_state=42,
+                )
+        st.plotly_chart(st.session_state["fig_pca"], use_container_width=True)
 
     with col_umap:
-        with st.spinner("Computing 2D UMAP projection..."):
-            fig_umap = plot_umap(
-                features=metadata["features"],
-                labels=metadata["labels"],
-                patient_ids=metadata["patient_ids"],
-                random_state=42,
-            )
-            st.plotly_chart(fig_umap, use_container_width=True)
+        if st.session_state.get("fig_umap") is None:
+            with st.spinner("Computing 2D UMAP projection..."):
+                st.session_state["fig_umap"] = plot_umap(
+                    features=metadata["features"],
+                    labels=metadata["labels"],
+                    patient_ids=metadata["patient_ids"],
+                    random_state=42,
+                )
+        st.plotly_chart(st.session_state["fig_umap"], use_container_width=True)
 
     st.markdown("---")
 
-    # Proceed to Step 2 Control
     if st.session_state["current_step"] == 1:
         st.markdown("#### Proceed to Step 2: Train / Test Split")
         st.write(
@@ -597,9 +637,9 @@ def main() -> None:
             st.session_state["current_step"] = 2
             st.rerun()
 
-    # If Step 2 or beyond, render Step 2 interface
     if st.session_state["current_step"] >= 2:
         render_step2_split(metadata)
+        render_step3_and_step4()
 
 
 if __name__ == "__main__":
