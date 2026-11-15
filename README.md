@@ -12,7 +12,6 @@ Web-based bioinformatics application for classifying cancer types from RNA-seq g
 ## Project Structure
 ```text
 .
-├── AGENTS.md
 ├── README.md
 ├── requirements.txt
 ├── app.py

@@ -3,12 +3,13 @@ from RNA-seq gene expression data.
 Step 1: Data Upload, Template, and Exploratory Visualization.
 Step 2: Stratified Train / Test Split (80% Training / 20% Testing).
 Step 3: Model Training (MLP Neural Network, Random Forest, Logistic Regression).
-Step 4: Model Evaluation, Comparison, and Biological Interpretability.
+Step 4: Model Evaluation, Comparison, and Single-Patient Clinical Inference.
 """
 
 from pathlib import Path
 from typing import Any, Dict
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.data_loader import (
@@ -24,17 +25,15 @@ from src.evaluation import (
     plot_feature_importance,
     plot_roc_curves,
 )
-from src.models import train_all_models
-from src.visualization import plot_pca, plot_umap
+from src.models import predict_single_patient_df, train_all_models
+from src.visualization import CATEGORICAL_PALETTE, plot_pca, plot_umap
 
-# Configure page layout and metadata
 st.set_page_config(
     page_title="GenoScope - RNA-seq Cancer Classification",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# Clinical custom styling adhering to AGENTS.md theme specifications
 st.markdown(
     """
     <style>
@@ -347,6 +346,155 @@ def render_step2_split(metadata: Dict[str, Any]) -> None:
         st.dataframe(preview_large_df(split_data["test_df"]), use_container_width=True, hide_index=True)
 
 
+def render_single_patient_upload() -> None:
+    """Render Single-Patient CSV File Upload and Demo File Generator for clinical inference."""
+    st.markdown("---")
+    st.markdown("### Single-Patient Clinical Diagnosis (Upload Patient CSV)")
+    st.markdown(
+        """
+        <div class="info-callout">
+            Upload a CSV file containing a <b>single patient's gene expression profile</b> to predict their
+            cancer type across all three trained models. If the CSV includes the ground-truth diagnosis column,
+            the application will automatically verify whether each model's prediction matches the real diagnosis.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    split_data = st.session_state["split_data"]
+    model_results = st.session_state["model_results"]
+    test_df: pd.DataFrame = split_data["test_df"]
+    test_features_df: pd.DataFrame = split_data["test_features_df"]
+    patient_col: str = split_data["patient_col"]
+    target_col: str = split_data["target_col"]
+    gene_cols = split_data["gene_cols"]
+
+    # Helper expander to export 1-patient demo CSV files from the last rows of the 20% test split
+    with st.expander("Export Demo Single-Patient CSV Files (From Last Rows of 20% Test Split)", expanded=False):
+        st.write(
+            "Select any patient from the last 10 rows of the held-out 20% test split to download a ready-to-upload "
+            "single-patient CSV file for live testing and demonstration."
+        )
+        tail_df = test_df.tail(min(10, len(test_df)))
+        tail_indices = list(tail_df.index)
+        tail_labels = [
+            f"Row {idx + 1}: {tail_df.loc[idx, patient_col]} (True Diagnosis: {tail_df.loc[idx, target_col]})"
+            for idx in tail_indices
+        ]
+
+        selected_tail_label = st.selectbox(
+            "Choose a Held-Out Test Patient to Export",
+            options=tail_labels,
+            key="export_demo_patient_select",
+        )
+        chosen_idx = tail_indices[tail_labels.index(selected_tail_label)]
+        chosen_patient_id = str(test_df.loc[chosen_idx, patient_col])
+
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            single_with_label_csv = test_df.loc[[chosen_idx]].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label=f"Download {chosen_patient_id} CSV (With True Diagnosis)",
+                data=single_with_label_csv,
+                file_name=f"patient_{chosen_patient_id}_with_diagnosis.csv",
+                mime="text/csv",
+                key="dl_single_with_label_btn",
+            )
+        with dl_col2:
+            single_blind_csv = test_features_df.loc[[chosen_idx]].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label=f"Download {chosen_patient_id} CSV (Blind - No Diagnosis)",
+                data=single_blind_csv,
+                file_name=f"patient_{chosen_patient_id}_blind.csv",
+                mime="text/csv",
+                key="dl_single_blind_btn",
+            )
+
+    # Single-Patient File Uploader
+    single_file = st.file_uploader(
+        "Upload Single-Patient CSV File (1 Patient Row + Gene Expressions)",
+        type=["csv"],
+        key="single_patient_csv_uploader",
+    )
+
+    if single_file is None:
+        return
+
+    try:
+        uploaded_patient_df = load_dataset_from_csv(single_file)
+        inference_result = predict_single_patient_df(
+            patient_df=uploaded_patient_df,
+            model_results=model_results,
+            gene_cols=gene_cols,
+            patient_col=patient_col,
+            target_col=target_col,
+        )
+    except Exception as exc:
+        st.error(f"Single-Patient Prediction Error: {exc}")
+        return
+
+    patient_id = inference_result["patient_id"]
+    true_diag = inference_result["true_diagnosis"]
+    preds = inference_result["predictions"]
+
+    st.markdown("#### Clinical Prediction Report")
+    if true_diag is not None:
+        st.markdown(
+            f"**Patient ID:** `{patient_id}` &nbsp;|&nbsp; **Actual Ground-Truth Diagnosis:** `{true_diag}`"
+        )
+    else:
+        st.markdown(
+            f"**Patient ID:** `{patient_id}` &nbsp;|&nbsp; **Ground-Truth Diagnosis:** *Not provided (Blind Inference)*"
+        )
+
+    pred_cols = st.columns(3)
+    for idx, key in enumerate(["mlp", "rf", "lr"]):
+        model_pred = preds[key]
+        with pred_cols[idx]:
+            st.metric(
+                label=model_pred["model_name"],
+                value=model_pred["predicted_class"],
+                delta=f"{model_pred['confidence_pct']:.1f}% confidence",
+            )
+            if model_pred["is_correct"] is True:
+                st.success(f"Correct: Matches real diagnosis ({true_diag})")
+            elif model_pred["is_correct"] is False:
+                st.error(f"Incorrect: Real diagnosis is {true_diag}")
+            else:
+                st.info("Blind prediction (no ground-truth column in file)")
+
+    # Side-by-side Probability Distribution Chart across all 3 models
+    fig_probs = go.Figure()
+    classes = split_data["classes"]
+    for idx, key in enumerate(["mlp", "rf", "lr"]):
+        model_pred = preds[key]
+        probs_pct = [model_pred["probabilities"].get(c, 0.0) * 100.0 for c in classes]
+        fig_probs.add_trace(
+            go.Bar(
+                name=model_pred["model_name"],
+                x=classes,
+                y=probs_pct,
+                marker_color=CATEGORICAL_PALETTE[idx % len(CATEGORICAL_PALETTE)],
+                text=[f"{p:.1f}%" for p in probs_pct],
+                textposition="auto",
+            )
+        )
+
+    fig_probs.update_layout(
+        title=f"Predicted Class Probability Distribution for Patient {patient_id}",
+        xaxis_title="Cancer Diagnosis Class",
+        yaxis_title="Predicted Probability (%)",
+        yaxis=dict(range=[0, 105], gridcolor="#E2E8F0"),
+        barmode="group",
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        font=dict(color="#0F172A", family="sans-serif"),
+        height=400,
+        margin=dict(l=40, r=40, t=60, b=40),
+    )
+    st.plotly_chart(fig_probs, use_container_width=True)
+
+
 def render_step3_and_step4() -> None:
     """Render Step 3 (Model Training) and Step 4 (Evaluation & Comparison)."""
     st.markdown("---")
@@ -508,6 +656,9 @@ def render_step3_and_step4() -> None:
             if fig_imp is not None:
                 st.plotly_chart(fig_imp, use_container_width=True)
 
+    # Render the Single-Patient CSV Upload & Clinical Diagnosis section
+    render_single_patient_upload()
+
 
 def main() -> None:
     """Main application execution pipeline for Steps 1, 2, 3, and 4."""
@@ -552,7 +703,6 @@ def main() -> None:
     raw_df: pd.DataFrame = st.session_state["raw_df"]
     source_label: str = st.session_state.get("source_label", "Active Dataset")
 
-    # Cache validation metadata so we don't re-validate 20,531 columns on every button click
     if "validated_metadata" not in st.session_state or st.session_state.get("validated_source") != source_label:
         with st.spinner("Validating dataset structure..."):
             is_valid, validation_msg, metadata = validate_dataset(raw_df)

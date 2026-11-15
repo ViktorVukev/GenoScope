@@ -16,7 +16,7 @@ except Exception:
 
 import umap
 
-# Categorical palette defined in AGENTS.md
+# Categorical palette defined 
 CATEGORICAL_PALETTE: List[str] = [
     "#0284C7",  # Clinical Sky Blue
     "#0D9488",  # Genomic Teal
