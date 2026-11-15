@@ -1,0 +1,111 @@
+name: GenoScope CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main", "develop", "feature/**"]
+  pull_request:
+    branches: ["main", "develop"]
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+
+# Cancel in-progress runs on the same branch if a new commit is pushed immediately
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # JOB 1: Code Quality, Style & Repository Guardrails (Fast Fail)
+  # ============================================================================
+  quality-and-guardrails:
+    name: Code Quality 
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+
+      - name: Install and run Ruff Linter
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+          # Check for syntax errors (E9), undefined names (F63, F7, F82)
+          ruff check src/ app.py --select=E9,F63,F7,F82 --target-version=py310
+
+  # ============================================================================
+  # JOB 2: Automated Unit Tests & Coverage Across Python Versions
+  # ============================================================================
+  unit-tests:
+    name: Pytest Suite (Python ${{ matrix.python-version }})
+    needs: quality-and-guardrails
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }} with Pip Cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run Pytest with Coverage Report
+        env:
+          NUMBA_DISABLE_JIT: "1" # Speeds up umap-learn import in CI containers
+        run: |
+          pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml
+
+      - name: Upload Coverage Artifact (Python 3.10)
+        if: matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ============================================================================
+  # JOB 3: Streamlit Application Smoke Test (Headless Boot Verification)
+  # ============================================================================
+  streamlit-smoke-test:
+    name: Streamlit Headless Boot Test
+    needs: unit-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10 with Pip Cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify app.py boots and serves HTTP 200
+        run: |
+          streamlit run app.py --server.headless true --server.port 8501 &
+          SERVER_PID=$!
+          sleep 6
+          curl --fail http://localhost:8501/_stcore/health
+          kill $SERVER_PID

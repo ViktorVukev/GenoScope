@@ -14,8 +14,7 @@ from sklearn.preprocessing import label_binarize
 from src.models import extract_feature_importances
 from src.visualization import CATEGORICAL_PALETTE
 
-FEATURE_IMPORTANCE_COLOR: str = "#0D9488"  # Genomic Teal from AGENTS.md
-
+FEATURE_IMPORTANCE_COLOR: str = "#0D9488"  
 
 def calculate_metrics(
     y_true: Union[pd.Series, np.ndarray],

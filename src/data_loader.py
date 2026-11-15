@@ -264,7 +264,7 @@ def split_train_test(
 ) -> Dict[str, Any]:
     """Split the cleaned RNA-seq dataset into stratified train and test partitions.
 
-    In accordance with bioinformatics best practices and AGENTS.md:
+    In accordance with bioinformatics best practices :
     1. 80% training data and 20% testing data (default test_size=0.20).
     2. Stratified sampling on the target cancer diagnosis column ensures identical
        class proportions across both splits.

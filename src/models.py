@@ -1,10 +1,11 @@
 """Machine learning and deep learning models for RNA-seq cancer classification.
-Implements Step 3: Neural Network (MLP), Random Forest, and Logistic Regression.
+Implements Step 3: Neural Network (MLP), Random Forest, Logistic Regression,
+and Single-Patient Clinical Inference.
 """
 
 from dataclasses import dataclass
 import time
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
@@ -55,24 +56,7 @@ def build_mlp_model(
     learning_rate_init: float = 0.001,
     random_state: int = 42,
 ) -> Pipeline:
-    """Build a standardized Multi-Layer Perceptron (MLP) Neural Network pipeline.
-
-    Parameters
-    ----------
-    hidden_layer_sizes : Tuple[int, ...], default=(128, 64)
-        Number of neurons in each hidden layer.
-    max_iter : int, default=300
-        Maximum number of training epochs.
-    learning_rate_init : float, default=0.001
-        Initial learning rate for the Adam optimizer.
-    random_state : int, default=42
-        Seed for reproducible weight initialization.
-
-    Returns
-    -------
-    Pipeline
-        Scikit-learn Pipeline with StandardScaler and MLPClassifier.
-    """
+    """Build a standardized Multi-Layer Perceptron (MLP) Neural Network pipeline."""
     return Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -99,22 +83,7 @@ def build_random_forest_model(
     max_depth: Union[int, None] = None,
     random_state: int = 42,
 ) -> RandomForestClassifier:
-    """Build a Random Forest classifier baseline.
-
-    Parameters
-    ----------
-    n_estimators : int, default=200
-        Number of decision trees in the forest.
-    max_depth : Union[int, None], default=None
-        Maximum depth of each tree. None expands until leaves are pure.
-    random_state : int, default=42
-        Seed for reproducible bootstrapping and feature subsampling.
-
-    Returns
-    -------
-    RandomForestClassifier
-        Configured Random Forest estimator.
-    """
+    """Build a Random Forest classifier baseline."""
     return RandomForestClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
@@ -129,22 +98,7 @@ def build_logistic_regression_model(
     max_iter: int = 1000,
     random_state: int = 42,
 ) -> Pipeline:
-    """Build a standardized multinomial Logistic Regression baseline pipeline.
-
-    Parameters
-    ----------
-    c_param : float, default=1.0
-        Inverse of L2 regularization strength.
-    max_iter : int, default=1000
-        Maximum iterations for solver convergence.
-    random_state : int, default=42
-        Seed for reproducibility.
-
-    Returns
-    -------
-    Pipeline
-        Scikit-learn Pipeline with StandardScaler and LogisticRegression.
-    """
+    """Build a standardized multinomial Logistic Regression baseline pipeline."""
     return Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -162,44 +116,20 @@ def build_logistic_regression_model(
 
 
 def extract_feature_importances(model: BaseEstimator) -> np.ndarray:
-    """Extract a 1D array of gene importance scores from a fitted model or Pipeline.
-
-    Supports:
-    - Tree ensembles via `feature_importances_` (Gini importance).
-    - Linear models via `coef_` (mean absolute coefficient across classes).
-    - MLP neural networks via `coefs_[0]` (mean absolute input-layer weight).
-
-    Parameters
-    ----------
-    model : BaseEstimator
-        Fitted Scikit-learn estimator or Pipeline.
-
-    Returns
-    -------
-    np.ndarray
-        1D NumPy array of importance scores of shape (n_genes,).
-
-    Raises
-    ------
-    ValueError
-        If the model does not expose recognizable feature importance attributes.
-    """
+    """Extract a 1D array of gene importance scores from a fitted model or Pipeline."""
     core_model = (
         model.named_steps["classifier"]
         if isinstance(model, Pipeline) and "classifier" in model.named_steps
         else model
     )
 
-    # 1. Random Forest / Tree-based models
     if hasattr(core_model, "feature_importances_"):
         return np.asarray(core_model.feature_importances_, dtype=float)
 
-    # 2. Logistic Regression / Linear models
     if hasattr(core_model, "coef_"):
         coef = np.abs(np.asarray(core_model.coef_, dtype=float))
         return np.mean(coef, axis=0) if coef.ndim > 1 else coef
 
-    # 3. Multi-Layer Perceptron (MLPClassifier) input-layer weights
     if hasattr(core_model, "coefs_") and len(core_model.coefs_) > 0:
         first_layer_weights = np.abs(np.asarray(core_model.coefs_[0], dtype=float))
         return np.mean(first_layer_weights, axis=1)
@@ -218,31 +148,7 @@ def train_and_predict_model(
     X_test: pd.DataFrame,
     classes: List[str],
 ) -> ModelResult:
-    """Fit a single model on (X_train, y_train) and generate blind predictions on X_test.
-
-    Parameters
-    ----------
-    estimator : BaseEstimator
-        Unfitted Scikit-learn model or Pipeline.
-    model_key : str
-        Short identifier key ('mlp', 'rf', 'lr').
-    model_name : str
-        Display name for UI and charts.
-    X_train : pd.DataFrame
-        Training gene expression matrix (80% split).
-    y_train : pd.Series
-        Training cancer diagnosis labels (80% split).
-    X_test : pd.DataFrame
-        Testing gene expression matrix (20% split, labels hidden).
-    classes : List[str]
-        Sorted list of distinct diagnosis classes.
-
-    Returns
-    -------
-    ModelResult
-        Structured result containing the fitted estimator, predictions, probabilities,
-        and gene importance scores.
-    """
+    """Fit a single model on (X_train, y_train) and generate blind predictions on X_test."""
     start_time = time.perf_counter()
     estimator.fit(X_train, y_train)
     elapsed = time.perf_counter() - start_time
@@ -250,7 +156,6 @@ def train_and_predict_model(
     y_pred = np.asarray(estimator.predict(X_test))
     raw_prob = np.asarray(estimator.predict_proba(X_test), dtype=float)
 
-    # Ensure probability columns strictly match the order of `classes`
     model_classes = list(estimator.classes_)
     if model_classes != list(classes):
         class_to_idx = {cls_name: idx for idx, cls_name in enumerate(model_classes)}
@@ -287,36 +192,7 @@ def train_all_models(
     lr_c: float = 1.0,
     random_state: int = 42,
 ) -> Dict[str, ModelResult]:
-    """Train all three benchmark models on the exact same 80% split and predict on the 20% split.
-
-    Parameters
-    ----------
-    X_train : pd.DataFrame
-        Training gene expression features (80%).
-    y_train : pd.Series
-        Training target diagnosis labels (80%).
-    X_test : pd.DataFrame
-        Testing gene expression features (20%, target hidden).
-    classes : List[str]
-        Sorted list of unique cancer diagnosis classes.
-    mlp_hidden_layers : Tuple[int, ...], default=(128, 64)
-        Hidden layer architecture for the Neural Network.
-    mlp_max_iter : int, default=300
-        Maximum epochs for the Neural Network.
-    rf_n_estimators : int, default=200
-        Number of trees for Random Forest.
-    lr_c : float, default=1.0
-        Inverse regularization strength for Logistic Regression.
-    random_state : int, default=42
-        Random seed for all three models.
-
-    Returns
-    -------
-    Dict[str, ModelResult]
-        Dictionary keyed by 'mlp', 'rf', and 'lr' mapping to their ModelResult objects.
-    """
-    # Fallback for tiny datasets (like the 30-row template) where early_stopping
-    # validation split (10%) would have fewer samples than classes
+    """Train all three benchmark models on the 80% split and predict on the 20% split."""
     mlp_estimator = build_mlp_model(
         hidden_layer_sizes=mlp_hidden_layers,
         max_iter=mlp_max_iter,
@@ -353,3 +229,93 @@ def train_all_models(
         )
 
     return results
+
+
+def predict_single_patient_df(
+    patient_df: pd.DataFrame,
+    model_results: Dict[str, ModelResult],
+    gene_cols: List[str],
+    patient_col: str,
+    target_col: str,
+) -> Dict[str, Any]:
+    """Validate an uploaded single-patient DataFrame and predict cancer diagnosis across all models.
+
+    Supports uploaded CSVs either WITH the ground-truth target column (for validation)
+    or WITHOUT the target column (blind clinical inference).
+
+    Parameters
+    ----------
+    patient_df : pd.DataFrame
+        Uploaded DataFrame containing 1 or more patient rows.
+    model_results : Dict[str, ModelResult]
+        Trained model dictionary returned by train_all_models().
+    gene_cols : List[str]
+        List of required gene feature column names from training.
+    patient_col : str
+        Expected patient identifier column name.
+    target_col : str
+        Expected target diagnosis column name (optional in uploaded file).
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - 'patient_id': str identifier of the first row
+        - 'true_diagnosis': Optional[str] ground-truth label if present in CSV, else None
+        - 'predictions': Dict[str, Dict[str, Any]] per-model predicted class, confidence,
+          and full class probability breakdown.
+    """
+    if patient_df is None or patient_df.empty:
+        raise ValueError("Uploaded patient file is empty.")
+
+    missing_genes = [g for g in gene_cols if g not in patient_df.columns]
+    if missing_genes:
+        preview = ", ".join(missing_genes[:5])
+        raise ValueError(
+            f"Uploaded file is missing {len(missing_genes)} required gene columns "
+            f"(e.g., {preview}). Ensure the file matches the training dataset genes."
+        )
+
+    # Extract first patient row
+    row = patient_df.iloc[[0]]
+
+    if patient_col in row.columns:
+        patient_id = str(row[patient_col].iloc[0])
+    else:
+        patient_id = str(row.iloc[0, 0])
+
+    true_diagnosis: Optional[str] = None
+    if target_col in row.columns:
+        val = row[target_col].iloc[0]
+        if pd.notna(val) and str(val).strip() != "":
+            true_diagnosis = str(val).strip()
+
+    X_single = row[gene_cols].apply(pd.to_numeric, errors="coerce")
+    if X_single.isnull().any().any():
+        raise ValueError("Uploaded patient record contains non-numeric or missing gene values.")
+
+    predictions: Dict[str, Dict[str, Any]] = {}
+    for key, res in model_results.items():
+        pred_label = str(res.estimator.predict(X_single)[0])
+        raw_prob = np.asarray(res.estimator.predict_proba(X_single)[0], dtype=float)
+
+        model_classes = list(res.estimator.classes_)
+        prob_map = {cls_name: 0.0 for cls_name in res.classes}
+        for cls_idx, cls_name in enumerate(model_classes):
+            prob_map[str(cls_name)] = float(raw_prob[cls_idx])
+
+        confidence = prob_map.get(pred_label, float(np.max(raw_prob)))
+
+        predictions[key] = {
+            "model_name": res.model_name,
+            "predicted_class": pred_label,
+            "confidence_pct": confidence * 100.0,
+            "probabilities": prob_map,
+            "is_correct": (pred_label == true_diagnosis) if true_diagnosis is not None else None,
+        }
+
+    return {
+        "patient_id": patient_id,
+        "true_diagnosis": true_diagnosis,
+        "predictions": predictions,
+    }
