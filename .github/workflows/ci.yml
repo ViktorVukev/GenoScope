@@ -2,9 +2,9 @@ name: GenoScope CI/CD Pipeline
 
 on:
   push:
-    branches: ["main", "develop", "feature/**"]
+    branches: ["main", "develop", "feature/models"]
   pull_request:
-    branches: ["main", "develop"]
+    branches: ["main"]
   workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
 
 # Cancel in-progress runs on the same branch if a new commit is pushed immediately
@@ -18,7 +18,7 @@ jobs:
   # ============================================================================
   quality-and-guardrails:
     name: Code Quality 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout repository
@@ -43,7 +43,7 @@ jobs:
   unit-tests:
     name: Pytest Suite (Python ${{ matrix.python-version }})
     needs: quality-and-guardrails
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     strategy:
       fail-fast: false
@@ -85,7 +85,7 @@ jobs:
   streamlit-smoke-test:
     name: Streamlit Headless Boot Test
     needs: unit-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout repository
