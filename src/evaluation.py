@@ -6,7 +6,6 @@ Handles model evaluation metrics and interactive Plotly visualizations for Step 
 from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.metrics import accuracy_score, auc, confusion_matrix, roc_curve
 from sklearn.preprocessing import label_binarize
@@ -80,28 +79,73 @@ def plot_confusion_matrix(
     Returns
     -------
     go.Figure
-        Plotly heatmap figure using the 'Blues' colormap.
+        Plotly heatmap figure using the 'Blues' colormap. Each cell shows the
+        patient count and the row percentage (share of that true diagnosis),
+        and colour encodes the row percentage so classes of different sizes
+        are comparable.
     """
     cm = confusion_matrix(y_true, y_pred, labels=classes)
+    row_totals = cm.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        row_pct = np.where(row_totals > 0, cm / row_totals * 100.0, 0.0)
 
-    fig = px.imshow(
-        cm,
-        x=classes,
-        y=classes,
-        text_auto=True,
-        color_continuous_scale="Blues",
-        labels=dict(x="Predicted Diagnosis", y="True Diagnosis", color="Patients"),
-        title=f"Confusion Matrix ({model_name})",
+    display_labels = [_wrap_label(c) for c in classes]
+    cell_text = [
+        [f"{cm[i, j]}<br>({row_pct[i, j]:.0f}%)" for j in range(len(classes))]
+        for i in range(len(classes))
+    ]
+    hover_counts = np.dstack([cm, np.broadcast_to(row_totals, cm.shape)])
+
+    fig = go.Figure(
+        go.Heatmap(
+            z=row_pct,
+            x=display_labels,
+            y=display_labels,
+            text=cell_text,
+            texttemplate="%{text}",
+            textfont=dict(size=14),
+            customdata=hover_counts,
+            colorscale="Blues",
+            zmin=0,
+            zmax=100,
+            showscale=False,
+            xgap=2,
+            ygap=2,
+            hovertemplate=(
+                "<b>True:</b> %{y}<br><b>Predicted:</b> %{x}<br>"
+                "<b>Patients:</b> %{customdata[0]} of %{customdata[1]} "
+                "(%{z:.0f}%)<extra></extra>"
+            ),
+        )
     )
 
     fig.update_layout(
+        title=f"Confusion Matrix ({model_name})",
+        xaxis=dict(title="Predicted Diagnosis", tickangle=0, side="bottom"),
+        yaxis=dict(title="True Diagnosis", autorange="reversed"),
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
         font=dict(color="#0F172A", family="sans-serif"),
         height=460,
-        margin=dict(l=40, r=40, t=60, b=40),
+        margin=dict(l=40, r=20, t=60, b=40),
     )
     return fig
+
+
+def _wrap_label(label: str, max_line: int = 12) -> str:
+    """Break a long class name onto two lines so axis labels stay horizontal."""
+    text = str(label)
+    if len(text) <= max_line or " " not in text:
+        return text
+    words = text.split(" ")
+    best_split, best_diff = 1, len(text)
+    for k in range(1, len(words)):
+        left = " ".join(words[:k])
+        right = " ".join(words[k:])
+        diff = abs(len(left) - len(right))
+        if diff < best_diff:
+            best_split, best_diff = k, diff
+    return " ".join(words[:best_split]) + "<br>" + " ".join(words[best_split:])
 
 
 def plot_roc_curves(
@@ -138,21 +182,6 @@ def plot_roc_curves(
 
     fig = go.Figure()
 
-    for i, class_name in enumerate(classes):
-        color = CATEGORICAL_PALETTE[i % len(CATEGORICAL_PALETTE)]
-        fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob_arr[:, i])
-        roc_auc = auc(fpr, tpr)
-
-        fig.add_trace(
-            go.Scatter(
-                x=fpr,
-                y=tpr,
-                mode="lines",
-                name=f"{class_name} (AUC = {roc_auc:.3f})",
-                line=dict(width=2.5, color=color),
-            )
-        )
-
     fig.add_trace(
         go.Scatter(
             x=[0, 1],
@@ -160,20 +189,66 @@ def plot_roc_curves(
             mode="lines",
             name="Random Chance (AUC = 0.500)",
             line=dict(dash="dash", color="#94A3B8", width=1.5),
+            hoverinfo="skip",
+            legendrank=2000,
         )
     )
 
+    # When several classes are perfectly separated their curves lie exactly on
+    # top of each other. Varying width and dash keeps every class visible.
+    dash_styles = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+    n_curves = 0
+    aucs: List[float] = []
+    skipped: List[str] = []
+
+    for i, class_name in enumerate(classes):
+        positives = int(y_bin[:, i].sum())
+        if positives == 0 or positives == len(y_bin):
+            skipped.append(str(class_name))
+            continue
+
+        color = CATEGORICAL_PALETTE[i % len(CATEGORICAL_PALETTE)]
+        fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob_arr[:, i])
+        roc_auc = float(auc(fpr, tpr))
+        aucs.append(roc_auc)
+
+        fig.add_trace(
+            go.Scatter(
+                x=fpr,
+                y=tpr,
+                mode="lines",
+                name=f"{class_name} (AUC = {roc_auc:.3f})",
+                line=dict(
+                    width=max(2.0, 6.0 - 1.5 * n_curves),
+                    color=color,
+                    dash=dash_styles[n_curves % len(dash_styles)],
+                ),
+                hovertemplate=(
+                    f"<b>{class_name}</b><br>FPR: %{{x:.2f}}<br>TPR: %{{y:.2f}}<extra></extra>"
+                ),
+            )
+        )
+        n_curves += 1
+
+    title = f"One-vs-Rest ROC Curves ({model_name})"
+    if aucs:
+        title += f"<br><sup>Macro-average AUC = {np.mean(aucs):.3f}</sup>"
+    if skipped:
+        title += (
+            f"<br><sup>Not in test set (no curve): {', '.join(skipped)}</sup>"
+        )
+
     fig.update_layout(
-        title=f"One-vs-Rest ROC Curves ({model_name})",
+        title=title,
         xaxis_title="False Positive Rate (1 - Specificity)",
         yaxis_title="True Positive Rate (Sensitivity)",
-        xaxis=dict(range=[0.0, 1.02], gridcolor="#E2E8F0"),
-        yaxis=dict(range=[0.0, 1.05], gridcolor="#E2E8F0"),
+        xaxis=dict(range=[-0.03, 1.03], gridcolor="#E2E8F0", zeroline=False, dtick=0.2),
+        yaxis=dict(range=[-0.03, 1.05], gridcolor="#E2E8F0", zeroline=False, dtick=0.2),
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
         font=dict(color="#0F172A", family="sans-serif"),
         height=460,
-        margin=dict(l=40, r=40, t=60, b=40),
+        margin=dict(l=40, r=40, t=90, b=40),
         legend=dict(
             x=0.98,
             y=0.05,
